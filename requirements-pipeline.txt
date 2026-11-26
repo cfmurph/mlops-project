@@ -8,3 +8,6 @@ requests==2.34.2
 mlflow-skinny==3.18.0
 pyarrow==25.0.1
 PyYAML==6.0.3
+s3fs==2026.9.0
+boto3==1.43.117
+psycopg[binary]==3.3.6

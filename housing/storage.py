@@ -21,14 +21,21 @@ def _fs(path: str):
     return fsspec.core.url_to_fs(path)
 
 
+def _fresh_fs(path: str):
+    """Filesystem with listings re-read: cloud filesystems cache them, and a long-running API must see new files."""
+    fs, p = _fs(path)
+    fs.invalidate_cache(p)
+    return fs, p
+
+
 def exists(*parts: str) -> bool:
-    fs, path = _fs(uri(*parts))
+    fs, path = _fresh_fs(uri(*parts))
     return fs.exists(path)
 
 
 def list_files(*parts: str) -> list[str]:
     """File names (not paths) directly under a folder, sorted; empty if the folder doesn't exist."""
-    fs, path = _fs(uri(*parts))
+    fs, path = _fresh_fs(uri(*parts))
     return sorted(Path(p).name for p in fs.ls(path, detail=False)) if fs.exists(path) else []
 
 
