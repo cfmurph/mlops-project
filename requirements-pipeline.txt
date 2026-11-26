@@ -1,0 +1,8 @@
+# Packages the Airflow tasks need (installed into the Airflow image).
+# Versions match Airflow 3.4.0's constraints file for Python 3.12.
+pandas==3.1.0
+openpyxl==3.1.5
+scikit-learn==1.9.1
+joblib==1.6.0
+requests==2.34.2
+mlflow-skinny==3.18.0

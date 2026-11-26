@@ -1,0 +1,8 @@
+# Local development and CI. Install with Airflow's constraints:
+#   pip install -r requirements.txt -c https://raw.githubusercontent.com/apache/airflow/constraints-3.4.0/constraints-3.12.txt
+-r requirements-pipeline.txt
+apache-airflow==3.4.0
+fastapi==0.162.0
+uvicorn==0.54.0
+httpx==0.28.1
+pytest==9.2.0

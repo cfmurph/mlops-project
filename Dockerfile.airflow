@@ -1,0 +1,4 @@
+FROM apache/airflow:3.4.0-python3.12
+COPY requirements-pipeline.txt /tmp/
+# Re-pinning apache-airflow stops pip from upgrading/downgrading it (official recommendation).
+RUN pip install --no-cache-dir "apache-airflow==3.4.0" -r /tmp/requirements-pipeline.txt
