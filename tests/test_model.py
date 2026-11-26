@@ -37,7 +37,8 @@ def test_gate():
 def test_end_to_end_train_promote_publish(crea, boc, tmp_path):
     df = build_features(crea, boc)
     prod = tmp_path / "production"
-    model, metrics = train_evaluate(df, prod, tmp_path / "mlruns")
+    model, metrics = train_evaluate(df, prod, tmp_path / "mlflow.db")
+    assert metrics["mae"] == min(metrics["gradient_boosting_mae"], metrics["damped_momentum_mae"])
     assert metrics["mae"] < metrics["baseline_mae"]  # synthetic data has a learnable trend
     assert promote(model, metrics, prod)
     out = publish_forecasts(df, prod)
@@ -45,5 +46,9 @@ def test_end_to_end_train_promote_publish(crea, boc, tmp_path):
     assert (prod / "forecasts.csv").exists() and (prod / "metadata.json").exists()
 
     # Retraining on the same data scores the same as production, so it still promotes (ties allowed).
-    _, metrics2 = train_evaluate(df, prod, tmp_path / "mlruns")
+    _, metrics2 = train_evaluate(df, prod, tmp_path / "mlflow.db")
     assert metrics2["production_mae"] is not None and should_promote(metrics2)
+
+
+def test_publish_skips_without_production_model(crea, boc, tmp_path):
+    assert publish_forecasts(build_features(crea, boc), tmp_path) is None
