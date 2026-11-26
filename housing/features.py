@@ -1,34 +1,52 @@
-"""Turn prices + rates into model features and a 3-month-ahead target."""
+"""Build model features from any set of sources, plus the forecast target."""
 import numpy as np
 import pandas as pd
 
-from housing.data import REGIONS
+from housing.config import Forecast
 
-HORIZON = 3  # months ahead to forecast
-FEATURES = [
-    "region", "month", "chg_1m", "chg_3m", "chg_6m", "chg_12m",
-    "mortgage_5y", "policy_rate", "mortgage_5y_chg_3m", "policy_rate_chg_3m",
-]
+NOT_FEATURES = {"date", "value", "target"}
 
 
-def build_features(crea: pd.DataFrame, boc: pd.DataFrame) -> pd.DataFrame:
-    df = crea.merge(boc, on="date", how="left").sort_values(["region", "date"]).reset_index(drop=True)
-    by_region = df.groupby("region")
-    log_price = np.log(df["price"])
-    log_by_region = log_price.groupby(df["region"])
+def build_features(fc: Forecast, tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """One row per region and month.
 
-    # Features look only backwards (shift(k) with k > 0).
+    - value: the forecast target's current level (e.g. benchmark price)
+    - chg_{k}m: log change of value over the past k months
+    - target: log change over the next fc.horizon_months (NaN for the most recent months)
+    - <source>__<column> and <source>__<column>__chg_3m for every other numeric source column
+    Features look only backwards; only `target` looks forwards.
+    """
+    df = (tables[fc.target_source][["date", "region", fc.target_column]]
+          .rename(columns={fc.target_column: "value"})
+          .sort_values(["region", "date"]).reset_index(drop=True))
+    log_value = np.log(df["value"])
+    by_region = log_value.groupby(df["region"])
     for k in (1, 3, 6, 12):
-        df[f"chg_{k}m"] = log_price - log_by_region.shift(k)
-    for c in ("mortgage_5y", "policy_rate"):
-        df[f"{c}_chg_3m"] = df[c] - by_region[c].shift(3)
+        df[f"chg_{k}m"] = log_value - by_region.shift(k)
     df["month"] = df["date"].dt.month
+    df["target"] = by_region.shift(-fc.horizon_months) - log_value
 
-    # Target looks forwards; it is NaN for the last HORIZON months of each region.
-    df["target"] = log_by_region.shift(-HORIZON) - log_price
+    for name in fc.sources:
+        df = df.merge(_source_features(name, tables[name], fc), on=_keys(tables[name]), how="left")
     return df
 
 
-def model_input(df: pd.DataFrame) -> pd.DataFrame:
-    """Feature columns with region as a fixed categorical, so train and predict agree."""
-    return df[FEATURES].assign(region=pd.Categorical(df["region"], categories=REGIONS))
+def _keys(table: pd.DataFrame) -> list[str]:
+    return ["date", "region"] if "region" in table else ["date"]
+
+
+def _source_features(name: str, table: pd.DataFrame, fc: Forecast) -> pd.DataFrame:
+    keys = _keys(table)
+    skip = fc.target_column if name == fc.target_source else None  # already used as `value`
+    cols = [c for c in table.select_dtypes("number").columns if c not in keys and c != skip]
+    t = table.sort_values(keys).reset_index(drop=True)
+    past = t.groupby("region")[cols].shift(3) if "region" in keys else t[cols].shift(3)
+    out = t[keys].copy()
+    for c in cols:
+        out[f"{name}__{c}"] = t[c]
+        out[f"{name}__{c}__chg_3m"] = t[c] - past[c]
+    return out
+
+
+def feature_columns(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns if c not in NOT_FEATURES]

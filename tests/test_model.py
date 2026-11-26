@@ -1,30 +1,49 @@
+import dataclasses
+
 import numpy as np
 import pandas as pd
 
-from housing.features import HORIZON, build_features
-from housing.model import promote, publish_forecasts, should_promote, split, train_evaluate
+from housing import pipeline, storage
+from housing.features import build_features, feature_columns
+from housing.model import CANDIDATES, ForecastModel, load_production, should_promote, split
 
 
-def test_target_is_future_change(crea, boc):
-    df = build_features(crea, boc)
+def test_target_is_future_change(fc, tables):
+    df = build_features(fc, tables)
     cal = df[df["region"] == "CALGARY"].reset_index(drop=True)
-    assert np.isclose(cal.loc[0, "target"], np.log(cal.loc[HORIZON, "price"] / cal.loc[0, "price"]))
-    assert cal["target"].tail(HORIZON).isna().all()
+    h = fc.horizon_months
+    assert np.isclose(cal.loc[0, "target"], np.log(cal.loc[h, "value"] / cal.loc[0, "value"]))
+    assert cal["target"].tail(h).isna().all()
 
 
-def test_features_do_not_use_future_prices(crea, boc):
-    before = build_features(crea, boc)
+def test_features_do_not_use_future_values(fc, tables, crea):
+    before = build_features(fc, tables)
     cutoff = crea["date"].sort_values().unique()[60]
-    changed = crea.assign(price=crea["price"].where(crea["date"] <= cutoff, 1.0))
-    after = build_features(changed, boc)
-    cols = [c for c in before if c.startswith("chg_")]
+    changed = {**tables, "crea_hpi": crea.assign(price=crea["price"].where(crea["date"] <= cutoff, 1.0))}
+    after = build_features(fc, changed)
+    cols = [c for c in feature_columns(before) if c != "region"]
     mask = before["date"] <= cutoff
     pd.testing.assert_frame_equal(before.loc[mask, cols], after.loc[mask, cols])
 
 
-def test_split_has_gap_so_training_targets_never_reach_holdout(crea, boc):
-    train, test = split(build_features(crea, boc))
-    assert train["date"].max() + pd.DateOffset(months=HORIZON) < test["date"].min()
+def test_new_source_columns_become_features_automatically(fc, tables, boc):
+    unemployment = boc[["date"]].assign(rate=np.linspace(7, 5, len(boc)))
+    fc2 = dataclasses.replace(fc, sources=fc.sources + ("statcan_jobs",))
+    df = build_features(fc2, {**tables, "statcan_jobs": unemployment})
+    assert {"statcan_jobs__rate", "statcan_jobs__rate__chg_3m", "boc_rates__mortgage_5y"} <= set(feature_columns(df))
+
+
+def test_split_has_gap_so_training_targets_never_reach_holdout(fc, tables):
+    train, test = split(build_features(fc, tables), fc)
+    assert train["date"].max() + pd.DateOffset(months=fc.horizon_months) < test["date"].min()
+    assert train["date"].min() >= pd.Timestamp(fc.train_start)
+
+
+def test_model_survives_new_regions_and_missing_features(fc, tables, cfg):
+    df = build_features(fc, tables).dropna(subset=["target"])
+    model = ForecastModel(CANDIDATES["gradient_boosting"](), feature_columns(df), list(cfg.regions)).fit(df)
+    new = df.tail(5).assign(region="GREATER_TORONTO").drop(columns=["boc_rates__policy_rate"])
+    assert np.isfinite(model.predict(new)).all()
 
 
 def test_gate():
@@ -34,21 +53,23 @@ def test_gate():
     assert not should_promote({"mae": 0.015, "baseline_mae": 0.02, "production_mae": 0.01})
 
 
-def test_end_to_end_train_promote_publish(crea, boc, tmp_path):
-    df = build_features(crea, boc)
-    prod = tmp_path / "production"
-    model, metrics = train_evaluate(df, prod, tmp_path / "mlflow.db")
-    assert metrics["mae"] == min(metrics["gradient_boosting_mae"], metrics["damped_momentum_mae"])
-    assert metrics["mae"] < metrics["baseline_mae"]  # synthetic data has a learnable trend
-    assert promote(model, metrics, prod)
-    out = publish_forecasts(df, prod)
-    assert len(out) == df["region"].nunique()
-    assert (prod / "forecasts.csv").exists() and (prod / "metadata.json").exists()
+def test_end_to_end_train_register_publish(fc, cfg, tables):
+    for name, df in tables.items():
+        storage.write(df, "raw", name, "latest.parquet")
+    assert pipeline.publish(fc) is None  # nothing promoted yet
+    assert pipeline.has_new_month(fc)
 
-    # Retraining on the same data scores the same as production, so it still promotes (ties allowed).
-    _, metrics2 = train_evaluate(df, prod, tmp_path / "mlflow.db")
-    assert metrics2["production_mae"] is not None and should_promote(metrics2)
+    metrics = pipeline.train(fc, cfg)
+    assert metrics["promoted"] and metrics["model_version"] == 1
+    assert metrics["mae"] == min(metrics[f"{c}_mae"] for c in fc.candidates)
+    assert not pipeline.has_new_month(fc)
 
+    model, version = load_production(fc.name)
+    assert version["model_version"] == 1 and version["holdout_mae"] == metrics["mae"]
 
-def test_publish_skips_without_production_model(crea, boc, tmp_path):
-    assert publish_forecasts(build_features(crea, boc), tmp_path) is None
+    out = pipeline.publish(fc)
+    assert len(out) == len(cfg.regions) and (out["model_version"] == 1).all()
+    assert storage.list_files("forecasts", fc.name) == [f"as_of={out['as_of'].max()}.parquet"]
+
+    # Same data again ties with production, so it promotes as version 2.
+    assert pipeline.train(fc, cfg)["model_version"] == 2

@@ -1,20 +1,22 @@
+import pandas as pd
 from fastapi.testclient import TestClient
 
-import src.app as app_module
+from housing import storage
+from src.app import app
 
-client = TestClient(app_module.app)
-
-
-def test_no_forecasts_yet(tmp_path, monkeypatch):
-    monkeypatch.setattr(app_module, "FORECASTS", tmp_path / "missing.csv")
-    assert client.get("/regions").status_code == 503
+client = TestClient(app)
 
 
-def test_forecast(tmp_path, monkeypatch):
-    f = tmp_path / "forecasts.csv"
-    f.write_text("region,as_of,horizon_month,current_price,forecast_price\nCALGARY,2026-10,2027-01,600000,606000\n")
-    monkeypatch.setattr(app_module, "FORECASTS", f)
-    assert client.get("/regions").json() == ["CALGARY"]
+def test_no_forecasts_yet():
+    assert client.get("/forecast/calgary").status_code == 503
+
+
+def test_forecast_serves_latest_month(cfg):
+    assert client.get("/regions").json() == cfg.regions
+    row = {"region": "CALGARY", "horizon_month": "2027-01", "current_value": 600000.0, "model_version": 1}
+    storage.write(pd.DataFrame([{**row, "as_of": "2026-09", "forecast_value": 1.0}]), "forecasts", "home_price", "as_of=2026-09.parquet")
+    storage.write(pd.DataFrame([{**row, "as_of": "2026-10", "forecast_value": 606000.0}]), "forecasts", "home_price", "as_of=2026-10.parquet")
     body = client.get("/forecast/calgary").json()
-    assert body["forecast_price"] == 606000.0 and "CREA" in body["source"]
+    assert body["forecast_value"] == 606000.0 and body["name"] == "Calgary" and "CREA" in body["source"]
     assert client.get("/forecast/TORONTO").status_code == 404
+    assert client.get("/forecast/calgary?target=rent").status_code == 404
