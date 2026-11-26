@@ -1,6 +1,6 @@
 # Airflow 3.4.0 for local development, trimmed from the official docker-compose.yaml:
 # LocalExecutor instead of Celery (no redis/worker/flower), no triggerer, no example DAGs,
-# plus the forecast API. ./data is shared by the pipeline and the API.
+# plus the forecast API. ./data is shared by the pipelines and the API; config.yaml by both.
 # Not for production. Start: docker compose up -d   UI: http://localhost:8080 (airflow / airflow)
 x-airflow-common:
   &airflow-common
@@ -22,10 +22,13 @@ x-airflow-common:
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
     AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
     PYTHONPATH: /opt/airflow  # so DAGs can import the housing package
-    HOUSING_DATA_DIR: /opt/airflow/data
+    DATA_URI: /opt/airflow/data  # or s3://bucket/path, gs://bucket/path
+    MLFLOW_TRACKING_URI: sqlite:////opt/airflow/data/mlflow.db
+    MLFLOW_DISABLE_AGENT_HINT: '1'
   volumes:
     - ./dags:/opt/airflow/dags
     - ./housing:/opt/airflow/housing
+    - ./config.yaml:/opt/airflow/config.yaml:ro
     - ./data:/opt/airflow/data
     - ./logs:/opt/airflow/logs
     - ./config:/opt/airflow/config
@@ -120,9 +123,10 @@ services:
     ports:
       - "8000:8000"
     environment:
-      FORECASTS_PATH: /data/production/forecasts.csv
+      DATA_URI: /data
     volumes:
       - ./data:/data:ro
+      - ./config.yaml:/app/config.yaml:ro
     restart: always
 
 volumes:

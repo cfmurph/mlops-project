@@ -1,0 +1,7 @@
+# Forecast API image: reads published forecasts through housing.storage.
+fastapi==0.162.0
+uvicorn==0.54.0
+pandas==3.1.0
+pyarrow==25.0.1
+PyYAML==6.0.3
+fsspec==2026.9.0

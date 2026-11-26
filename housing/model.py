@@ -1,22 +1,23 @@
-"""Train, evaluate against baselines, promote, and publish forecasts."""
-import json
-from pathlib import Path
+"""Candidates, training with a promotion gate, and the MLflow model registry."""
+import os
 
-import joblib
 import mlflow
-import numpy as np
+import mlflow.sklearn
 import pandas as pd
+from mlflow import MlflowClient
+from mlflow.exceptions import MlflowException
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error
 
-from housing.features import HORIZON, model_input
+from housing import storage
+from housing.config import Forecast
+from housing.features import feature_columns
 
-HOLDOUT_MONTHS = 24
-TRAIN_START = "2012-01-01"  # the 2005-2011 boom/bust patterns hurt forecasts of today's market
+ALIAS = "production"
 
 
 class DampedMomentum:
-    """Rule-based candidate: half of the last 3 months' price change continues."""
+    """Rule-based candidate: half of the last 3 months' change continues."""
 
     def fit(self, X, y):
         return self
@@ -25,6 +26,7 @@ class DampedMomentum:
         return 0.5 * X["chg_3m"].fillna(0).to_numpy()
 
 
+# To add a candidate: add it here and list its name under `candidates` in config.yaml.
 CANDIDATES = {
     "gradient_boosting": lambda: HistGradientBoostingRegressor(
         max_depth=2, learning_rate=0.05, max_iter=100, min_samples_leaf=50, random_state=0),
@@ -32,48 +34,38 @@ CANDIDATES = {
 }
 
 
-def split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Time-based split. Training targets must end before the holdout starts, so leave a HORIZON-month gap."""
-    labeled = df.dropna(subset=["target"])
-    holdout_start = labeled["date"].max() - pd.DateOffset(months=HOLDOUT_MONTHS - 1)
-    train = labeled[labeled["date"] < holdout_start - pd.DateOffset(months=HORIZON)]
-    return train, labeled[labeled["date"] >= holdout_start]
+class ForecastModel:
+    """An estimator plus the inputs it was trained on, so it keeps working when regions or sources change.
 
-
-def _mae(model, test: pd.DataFrame) -> float:
-    return float(mean_absolute_error(test["target"], model.predict(model_input(test))))
-
-
-def train_evaluate(df: pd.DataFrame, prod_dir: Path, mlflow_db: Path) -> tuple[object, dict]:
-    """Fit every candidate and keep the best; score it, the naive 'no change' baseline and the production model on one holdout.
-
-    MAE is on 3-month log price change, so 0.02 is roughly 2% of price.
+    Missing feature columns become NaN; regions it never saw become a missing category.
     """
-    train, test = split(df)
-    train = train[train["date"] >= TRAIN_START]
-    fitted = {name: make().fit(model_input(train), train["target"]) for name, make in CANDIDATES.items()}
-    scores = {name: _mae(m, test) for name, m in fitted.items()}
-    best = min(scores, key=scores.get)
-    model = fitted[best]
-    prod = prod_dir / "model.joblib"
-    metrics = {
-        "model": best,
-        "mae": scores[best],
-        **{f"{name}_mae": v for name, v in scores.items()},
-        "baseline_mae": float(test["target"].abs().mean()),  # predicting zero change
-        "production_mae": _mae(joblib.load(prod), test) if prod.exists() else None,
-        "data_month": f"{df['date'].max():%Y-%m}",
-        "train_rows": len(train),
-        "holdout_rows": len(test),
-    }
 
-    mlflow.set_tracking_uri(f"sqlite:///{mlflow_db.resolve()}")
-    mlflow.set_experiment("housing")
-    with mlflow.start_run(run_name=metrics["data_month"]):
-        mlflow.log_params({"model": best, "horizon_months": HORIZON, "holdout_months": HOLDOUT_MONTHS,
-                           "train_start": TRAIN_START, "data_month": metrics["data_month"]})
-        mlflow.log_metrics({k: v for k, v in metrics.items() if k.endswith("mae") and v is not None})
-    return model, metrics
+    def __init__(self, estimator, features: list[str], regions: list[str]):
+        self.estimator, self.features, self.regions = estimator, features, regions
+
+    def _input(self, df: pd.DataFrame) -> pd.DataFrame:
+        X = df.reindex(columns=self.features)
+        return X.assign(region=pd.Categorical(df["region"], categories=self.regions))
+
+    def fit(self, df: pd.DataFrame) -> "ForecastModel":
+        self.estimator.fit(self._input(df), df["target"])
+        return self
+
+    def predict(self, df: pd.DataFrame):
+        return self.estimator.predict(self._input(df))
+
+
+def split(df: pd.DataFrame, fc: Forecast) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Time-based split. Training targets must end before the holdout starts, so leave a horizon-sized gap."""
+    labeled = df.dropna(subset=["target"])
+    holdout_start = labeled["date"].max() - pd.DateOffset(months=fc.holdout_months - 1)
+    train = labeled[labeled["date"] < holdout_start - pd.DateOffset(months=fc.horizon_months)]
+    return train[train["date"] >= fc.train_start], labeled[labeled["date"] >= holdout_start]
+
+
+def mae(model, df: pd.DataFrame) -> float:
+    """Mean absolute error on log change (0.01 is roughly 1% of the value)."""
+    return float(mean_absolute_error(df["target"], model.predict(df)))
 
 
 def should_promote(metrics: dict) -> bool:
@@ -82,27 +74,57 @@ def should_promote(metrics: dict) -> bool:
     return beats_baseline and beats_production
 
 
-def promote(model, metrics: dict, prod_dir: Path) -> bool:
-    if not should_promote(metrics):
-        return False
-    prod_dir.mkdir(parents=True, exist_ok=True)
-    joblib.dump(model, prod_dir / "model.joblib")
-    (prod_dir / "metadata.json").write_text(json.dumps({**metrics, "promoted_at": pd.Timestamp.now().isoformat()}, indent=2))
-    return True
+# --- MLflow ---------------------------------------------------------------------------------
+
+def use_experiment(name: str) -> None:
+    mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI", f"sqlite:///{storage.uri('mlflow.db')}"))
+    if mlflow.get_experiment_by_name(name) is None:
+        mlflow.create_experiment(name, artifact_location=storage.absolute_uri("mlartifacts", name))
+    mlflow.set_experiment(name)
 
 
-def publish_forecasts(df: pd.DataFrame, prod_dir: Path) -> pd.DataFrame | None:
-    """Forecast each region's price HORIZON months after its latest month, using the production model."""
-    if not (prod_dir / "model.joblib").exists():
-        return None  # nothing has passed the gate yet
-    model = joblib.load(prod_dir / "model.joblib")
-    latest = df[df["date"] == df.groupby("region")["date"].transform("max")]
-    out = pd.DataFrame({
-        "region": latest["region"],
-        "as_of": latest["date"].dt.strftime("%Y-%m"),
-        "horizon_month": (latest["date"] + pd.DateOffset(months=HORIZON)).dt.strftime("%Y-%m"),
-        "current_price": latest["price"].round(),
-        "forecast_price": (latest["price"] * np.exp(model.predict(model_input(latest)))).round(),
-    })
-    out.to_csv(prod_dir / "forecasts.csv", index=False)
-    return out
+def load_production(name: str) -> tuple[ForecastModel, dict] | None:
+    """The model behind the `production` alias and its version info, or None if nothing is promoted yet."""
+    use_experiment(name)
+    try:
+        version = MlflowClient().get_model_version_by_alias(name, ALIAS)
+    except MlflowException:
+        return None
+    model = mlflow.sklearn.load_model(f"models:/{name}@{ALIAS}")
+    return model, {"model_version": int(version.version), "holdout_mae": float(version.tags["holdout_mae"])}
+
+
+def train_evaluate_promote(fc: Forecast, df: pd.DataFrame, regions: list[str]) -> dict:
+    """Fit every candidate, keep the best, and register it as production if it passes the gate."""
+    use_experiment(fc.name)
+    train, test = split(df, fc)
+    features = feature_columns(df)
+    fitted = {n: ForecastModel(CANDIDATES[n](), features, regions).fit(train) for n in fc.candidates}
+    scores = {n: mae(m, test) for n, m in fitted.items()}
+    best = min(scores, key=scores.get)
+    production = load_production(fc.name)
+    metrics = {
+        "model": best,
+        "mae": scores[best],
+        **{f"{n}_mae": s for n, s in scores.items()},
+        "baseline_mae": float(test["target"].abs().mean()),  # predicting no change
+        "production_mae": mae(production[0], test) if production else None,
+        "data_month": f"{df['date'].max():%Y-%m}",
+    }
+    metrics["promoted"] = should_promote(metrics)
+
+    with mlflow.start_run(run_name=metrics["data_month"]):
+        mlflow.log_params({"model": best, "data_month": metrics["data_month"], "horizon_months": fc.horizon_months,
+                           "holdout_months": fc.holdout_months, "train_start": fc.train_start,
+                           "n_features": len(features), "n_regions": len(regions)})
+        mlflow.log_metrics({k: v for k, v in metrics.items() if k.endswith("mae") and v is not None})
+        mlflow.set_tag("promoted", metrics["promoted"])
+        if metrics["promoted"]:
+            info = mlflow.sklearn.log_model(fitted[best], name="model", registered_model_name=fc.name,
+                                            serialization_format=mlflow.sklearn.SERIALIZATION_FORMAT_CLOUDPICKLE)
+            client = MlflowClient()
+            version = info.registered_model_version
+            client.set_model_version_tag(fc.name, version, "holdout_mae", str(metrics["mae"]))
+            client.set_registered_model_alias(fc.name, ALIAS, version)
+            metrics["model_version"] = int(version)
+    return metrics
