@@ -118,7 +118,7 @@ def train_evaluate_promote(fc: Forecast, df: pd.DataFrame, regions: list[str]) -
                            "holdout_months": fc.holdout_months, "train_start": fc.train_start,
                            "n_features": len(features), "n_regions": len(regions)})
         mlflow.log_metrics({k: v for k, v in metrics.items() if k.endswith("mae") and v is not None})
-        mlflow.set_tag("promoted", metrics["promoted"])
+        mlflow.set_tags({"promoted": metrics["promoted"], "env": os.environ.get("HOUSING_ENV", "dev")})
         if metrics["promoted"]:
             info = mlflow.sklearn.log_model(fitted[best], name="model", registered_model_name=fc.name,
                                             serialization_format=mlflow.sklearn.SERIALIZATION_FORMAT_CLOUDPICKLE)

@@ -1,13 +1,12 @@
-# Airflow 3.4.0 for local development, trimmed from the official docker-compose.yaml:
-# LocalExecutor instead of Celery (no redis/worker/flower), no triggerer, no example DAGs,
-# plus the forecast API and the project datastore.
-# Not for production. Start: docker compose up -d   UI: http://localhost:8080 (airflow / airflow)
+# Airflow 3.4.0 trimmed from the official docker-compose.yaml (LocalExecutor, no redis/worker/flower/triggerer,
+# no example DAGs), plus the forecast API and the project datastore.
 #
-# Datastore: local by default (SeaweedFS S3 + mlflow-db Postgres). For cloud (R2 + Neon):
-#   cp .env.cloud.example .env.cloud  # fill in
-#   docker compose --env-file .env.cloud up -d
+# This file on its own is the DEV environment: local datastore, code bind-mounted for live edits, dev passwords.
+#   docker compose up -d        Airflow UI: http://localhost:8080 (airflow / airflow)   API: http://localhost:8000
+# PROD adds docker-compose.prod.yaml and envs/prod.env (see README "Environments"); CI deploys it.
 x-datastore-env:
   &datastore-env
+  HOUSING_ENV: ${HOUSING_ENV:-dev}
   DATA_URI: ${DATA_URI:-s3://housing}
   AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-housing}
   AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-housing-secret}
@@ -27,13 +26,14 @@ x-airflow-common:
     <<: *datastore-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg://airflow:airflow@postgres/airflow
-    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg://airflow:${AIRFLOW_DB_PASSWORD:-airflow}@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
-    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET:-airflow_jwt_secret}
-    AIRFLOW__API_AUTH__JWT_ISSUER: ${AIRFLOW__API_AUTH__JWT_ISSUER:-airflow}
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:-airflow_jwt_secret}
+    AIRFLOW__API_AUTH__JWT_ISSUER: airflow
+    AIRFLOW__API__INSTANCE_NAME: Housing (${HOUSING_ENV:-dev})
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
     AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
     PYTHONPATH: /opt/airflow  # so DAGs can import the housing package
@@ -51,8 +51,10 @@ x-airflow-common:
       condition: service_healthy
     seaweedfs:
       condition: service_healthy
+      required: false  # not started in prod
     mlflow-db:
       condition: service_healthy
+      required: false
 
 services:
   # Project datastore (local). S3-compatible object storage for all project files.
@@ -91,12 +93,11 @@ services:
       start_period: 5s
     restart: always
 
-
   postgres:
     image: postgres:16
     environment:
       POSTGRES_USER: airflow
-      POSTGRES_PASSWORD: airflow
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:-airflow}
       POSTGRES_DB: airflow
     volumes:
       - postgres-db-volume:/var/lib/postgresql/data
@@ -167,8 +168,8 @@ services:
       <<: *airflow-common-env
       _AIRFLOW_DB_MIGRATE: 'true'
       _AIRFLOW_WWW_USER_CREATE: 'true'
-      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
-      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+      _AIRFLOW_WWW_USER_USERNAME: airflow
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-airflow}
     user: "0:0"
 
   api:
@@ -182,6 +183,7 @@ services:
     depends_on:
       seaweedfs:
         condition: service_healthy
+        required: false
     restart: always
 
 volumes:

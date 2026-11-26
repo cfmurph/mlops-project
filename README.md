@@ -26,7 +26,7 @@ FastAPI :8000 ── GET /forecast/{region}?target=<name>
 - **Monitor** compares old forecasts with what actually happened once their month arrives, and fails if live error
   exceeds `max_error_ratio` × the model's holdout error.
 
-## Run it (Docker, about 4 GB RAM)
+## Run dev (Docker, about 4 GB RAM)
 ```bash
 docker compose up -d --build          # Airflow UI: http://localhost:8080  (airflow / airflow)
 ```
@@ -38,23 +38,49 @@ curl localhost:8000/forecast/calgary
 ```
 Stop: `docker compose down` (add `-v` to also delete Airflow's database).
 
-## Datastore
-Local and cloud speak the same protocols (S3 for files, Postgres for MLflow), so switching is settings only.
+## Environments
+| | Dev | Prod |
+|---|---|---|
+| Where | Your laptop: `docker compose up -d` | Oracle Cloud Always Free ARM VM, deployed by GitHub Actions |
+| Code | Bind-mounted `dags/`, `housing/`, `config.yaml`: edits apply live | Baked into images tagged with the git SHA (exactly what CI tested) |
+| Datastore | Local SeaweedFS + Postgres containers | Cloudflare R2 + Neon Postgres |
+| Secrets | Dev defaults in `docker-compose.yaml` | GitHub Environment secret `PROD_ENV_FILE`, written to the VM at deploy time |
+| Airflow UI | http://localhost:8080 | VM's localhost only: `ssh -L 8080:localhost:8080 <user>@<vm>`, then http://localhost:8080 |
+| Forecast API | http://localhost:8000 | `http://<vm>:8000` |
 
-| Holds | Local (default) | Cloud |
+`/health`, the Airflow UI title ("Housing (dev)" / "Housing (prod)") and MLflow run tags show which environment you're in.
+Prod = `docker-compose.yaml` + `docker-compose.prod.yaml` + `envs/prod.env`.
+
+**Release flow**
+1. Work on a branch and test in dev. Open a PR: CI runs the tests and checks both environments' compose configs.
+2. Merge to `main`: CI builds arm64 images tagged with the commit SHA and pushes them to ghcr.io.
+3. The deploy job waits for approval (Actions → the run → **Review deployments** → Approve). It then copies the compose
+   files to the VM, writes `envs/prod.env`, pulls the images, restarts, and fails unless `/health` reports `prod`.
+4. **Roll back:** Actions → CI/CD → **Run workflow**, with `image_tag` set to an earlier commit SHA (same approval).
+
+**One-time prod setup**
+1. **VM:** Oracle Cloud → create an Always Free *Ampere A1* instance (Ubuntu, e.g. 2 OCPU / 12 GB). Free ARM capacity is
+   sometimes "out of capacity" in a region; retry later or pick another availability domain. In the VCN security list,
+   allow TCP 8000. Copy `deploy/bootstrap-vm.sh` to the VM and run it once.
+2. **Deploy key:** `ssh-keygen -t ed25519 -f prod_deploy -N ""`, append `prod_deploy.pub` to the VM's `~/.ssh/authorized_keys`.
+3. **Datastore:** create an R2 bucket (e.g. `housing-prod`) with an API token (Object Read & Write), and a Neon project.
+4. **Settings:** copy `envs/prod.env.example`, fill it in (generate the Airflow secrets as the comments show).
+5. **GitHub** → Settings → Environments → `production` → add secrets: `PROD_HOST` (VM IP), `PROD_USER` (e.g. `ubuntu`),
+   `PROD_SSH_KEY` (contents of `prod_deploy`), `PROD_ENV_FILE` (the whole filled-in file). Then delete the local copies.
+6. Run a deploy (merge to `main`, or **Run workflow**), approve it, then in the prod Airflow UI unpause
+   `forecast_home_price`, `monitor_home_price`, then `ingest`.
+
+## Datastore
+Local and cloud speak the same protocols (S3 for files, Postgres for MLflow), so they differ only in settings.
+
+| Holds | Dev (local containers) | Prod (cloud) |
 |---|---|---|
 | Files: raw snapshots, forecasts, monitoring, state, model files | `seaweedfs` container, S3 API at `localhost:8333`, bucket `housing` | Cloudflare R2 bucket |
 | MLflow runs and model registry | `mlflow-db` Postgres container at `localhost:5433` | Neon Postgres |
 
 Local data persists in Docker volumes (`seaweedfs-volume`, `mlflow-db-volume`); `docker compose down -v` deletes it.
 
-**Switch to cloud**
-1. Cloudflare: create an R2 bucket and an API token with Object Read & Write on it.
-2. Neon: create a project and copy its connection string.
-3. `cp .env.cloud.example .env.cloud`, fill it in (`.env.cloud` is git-ignored).
-4. `docker compose --env-file .env.cloud up -d`, then trigger `ingest`.
-
-**Look at the data**
+**Look at the dev data**
 ```bash
 # SQL over the Parquet files with DuckDB
 uv run --with duckdb python -c "
@@ -107,5 +133,6 @@ To point the venv at the Docker datastore instead:
 - `dags/`: `ingest.py`, `forecast.py`, `monitor.py` (thin; forecast and monitor DAGs are generated from config)
 - `src/app.py`: forecast API
 - `docker-compose.yaml`: Airflow 3.4 (LocalExecutor) + datastore (SeaweedFS, MLflow Postgres) + API
-- `.env.cloud.example`: settings template for the cloud datastore (R2 + Neon)
-- `.github/workflows/ci.yml`: tests on every push and PR; builds and pushes both images to ghcr.io from `main`
+- `docker-compose.prod.yaml`, `envs/prod.env.example`: prod overlay and its settings template
+- `deploy/`: `bootstrap-vm.sh` (one-time VM setup), `deploy.sh` (run on the VM by CI)
+- `.github/workflows/ci.yml`: tests + config checks on every PR; on `main` builds images and deploys to prod after approval

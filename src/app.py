@@ -1,4 +1,6 @@
 """Serve the latest published forecasts. Run: uvicorn src.app:app"""
+import os
+
 from fastapi import FastAPI, HTTPException
 
 from housing import storage
@@ -11,7 +13,7 @@ app = FastAPI(title="Canadian housing forecast")
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "env": os.environ.get("HOUSING_ENV", "dev")}
 
 
 @app.get("/regions")
