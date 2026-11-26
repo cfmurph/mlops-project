@@ -1,12 +1,21 @@
-name: CI
+name: CI/CD
 
+# PRs and pushes: tests + render both environments' compose configs.
+# Push to main: also build arm64 images tagged with the commit SHA, then deploy to prod after approval
+# (the "production" environment requires a reviewer). Rollback: "Run workflow" with an older image_tag.
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Existing image tag (git SHA) to deploy to prod, e.g. to roll back"
+        required: true
 
 jobs:
   test:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,11 +25,15 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt -c https://raw.githubusercontent.com/apache/airflow/constraints-3.4.0/constraints-3.12.txt
       - run: pytest -v
+      - name: Render dev and prod compose configs
+        run: |
+          docker compose config -q
+          docker compose -f docker-compose.yaml -f docker-compose.prod.yaml --env-file envs/prod.env.example config -q
 
-  build-and-push:
+  build:
     needs: test
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm  # prod VM is ARM
     permissions:
       contents: read
       packages: write
@@ -31,10 +44,42 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push images to GitHub Container Registry
+      - name: Build and push images
         run: |
-          REPO=ghcr.io/${GITHUB_REPOSITORY,,}
-          docker build -t $REPO/api:${{ github.sha }} -t $REPO/api:latest .
-          docker build -f Dockerfile.airflow -t $REPO/airflow:${{ github.sha }} -t $REPO/airflow:latest .
-          docker push --all-tags $REPO/api
-          docker push --all-tags $REPO/airflow
+          REPO="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker build -f Dockerfile.airflow -t "$REPO/airflow:$GITHUB_SHA" -t "$REPO/airflow:latest" .
+          docker build -t "$REPO/api:$GITHUB_SHA" -t "$REPO/api:latest" .
+          docker push --all-tags "$REPO/airflow"
+          docker push --all-tags "$REPO/api"
+
+  deploy:
+    needs: [build]
+    # Runs after a successful build on main, or on its own for a manual (rollback) deploy.
+    if: always() && (needs.build.result == 'success' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    environment: production  # waits for approval; holds the PROD_* secrets
+    permissions:
+      contents: read
+      packages: read
+    concurrency: production
+    env:
+      IMAGE_TAG: ${{ inputs.image_tag || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.PROD_SSH_KEY }}" > ~/.ssh/id_prod && chmod 600 ~/.ssh/id_prod
+          ssh-keyscan -H "${{ secrets.PROD_HOST }}" >> ~/.ssh/known_hosts
+      - name: Copy release files and settings to the VM
+        env:
+          PROD_ENV_FILE: ${{ secrets.PROD_ENV_FILE }}
+        run: |
+          TARGET="${{ secrets.PROD_USER }}@${{ secrets.PROD_HOST }}"
+          scp -i ~/.ssh/id_prod docker-compose.yaml docker-compose.prod.yaml deploy/deploy.sh "$TARGET:/opt/housing/"
+          { printf '%s\n' "$PROD_ENV_FILE" | grep -v '^IMAGE_TAG='; echo "IMAGE_TAG=$IMAGE_TAG"; } \
+            | ssh -i ~/.ssh/id_prod "$TARGET" 'umask 077 && cat > /opt/housing/envs/prod.env'
+      - name: Deploy
+        run: |
+          ssh -i ~/.ssh/id_prod "${{ secrets.PROD_USER }}@${{ secrets.PROD_HOST }}" \
+            "GHCR_USER='${{ github.actor }}' GHCR_TOKEN='${{ secrets.GITHUB_TOKEN }}' bash /opt/housing/deploy.sh"

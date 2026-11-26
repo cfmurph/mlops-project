@@ -7,4 +7,5 @@ config/
 **/__pycache__/
 .pytest_cache/
 .env.*
-!.env.cloud.example
+envs/*.env
+!envs/*.env.example

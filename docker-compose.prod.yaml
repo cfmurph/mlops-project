@@ -1,0 +1,48 @@
+# PROD overlay. Used with the base file by deploy/deploy.sh:
+#   docker compose -f docker-compose.yaml -f docker-compose.prod.yaml --env-file envs/prod.env up -d
+# Differences from dev: released images from ghcr.io (code baked in, tagged with the git SHA), no code bind mounts,
+# cloud datastore from envs/prod.env instead of the local containers, Airflow UI only on the VM's localhost.
+# !reset/!override tags don't survive YAML anchors, so each Airflow service repeats build/volumes.
+x-prod-airflow:
+  &prod-airflow
+  image: ghcr.io/cfmurph/mlops-project/airflow:${IMAGE_TAG:?set IMAGE_TAG}
+  restart: unless-stopped
+
+services:
+  # Local datastore is never started in prod; the cloud one is configured in envs/prod.env.
+  seaweedfs:
+    profiles: [local-datastore]
+  mlflow-db:
+    profiles: [local-datastore]
+
+  postgres:
+    restart: unless-stopped
+
+  airflow-apiserver:
+    <<: *prod-airflow
+    build: !reset null
+    volumes: !override [./logs:/opt/airflow/logs, ./config:/opt/airflow/config]
+    ports: !override
+      - "127.0.0.1:8080:8080"  # reach it with: ssh -L 8080:localhost:8080 <vm>
+
+  airflow-scheduler:
+    <<: *prod-airflow
+    build: !reset null
+    volumes: !override [./logs:/opt/airflow/logs, ./config:/opt/airflow/config]
+
+  airflow-dag-processor:
+    <<: *prod-airflow
+    build: !reset null
+    volumes: !override [./logs:/opt/airflow/logs, ./config:/opt/airflow/config]
+
+  airflow-init:
+    <<: *prod-airflow
+    build: !reset null
+    volumes: !override [./logs:/opt/airflow/logs, ./config:/opt/airflow/config]
+    restart: "no"
+
+  api:
+    image: ghcr.io/cfmurph/mlops-project/api:${IMAGE_TAG:?set IMAGE_TAG}
+    build: !reset null
+    volumes: !reset []
+    restart: unless-stopped

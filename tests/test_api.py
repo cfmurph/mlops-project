@@ -7,6 +7,12 @@ from src.app import app
 client = TestClient(app)
 
 
+def test_health_reports_environment(monkeypatch):
+    assert client.get("/health").json() == {"status": "ok", "env": "dev"}
+    monkeypatch.setenv("HOUSING_ENV", "prod")
+    assert client.get("/health").json()["env"] == "prod"
+
+
 def test_no_forecasts_yet():
     assert client.get("/forecast/calgary").status_code == 503
 

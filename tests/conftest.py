@@ -17,6 +17,7 @@ def isolated_storage(tmp_path, monkeypatch):
     monkeypatch.setenv("DATA_URI", str(tmp_path / "data"))
     monkeypatch.setenv("MLFLOW_TRACKING_URI", f"sqlite:///{tmp_path / 'mlflow.db'}")
     monkeypatch.setenv("MLFLOW_DISABLE_AGENT_HINT", "1")
+    monkeypatch.delenv("HOUSING_ENV", raising=False)
 
 
 @pytest.fixture
