@@ -15,7 +15,8 @@ def _read(name: str) -> pd.DataFrame:
     return pd.read_csv(RAW / f"{name}.csv", parse_dates=["date"])
 
 
-@dag(schedule="@weekly", start_date=datetime(2026, 1, 1), catchup=False, tags=["housing"])
+# max_active_runs=1: runs share files in DATA, so they must not overlap.
+@dag(schedule="@weekly", start_date=datetime(2026, 1, 1), catchup=False, max_active_runs=1, tags=["housing"])
 def housing_pipeline():
     @task
     def fetch_crea():
@@ -47,7 +48,7 @@ def housing_pipeline():
     @task
     def train_evaluate_promote() -> dict:
         from housing.model import promote, train_evaluate
-        model, metrics = train_evaluate(_read("features"), PROD, DATA / "mlruns")
+        model, metrics = train_evaluate(_read("features"), PROD, DATA / "mlflow.db")
         metrics["promoted"] = promote(model, metrics, PROD)
         LAST_TRAINED.write_text(metrics["data_month"])
         return metrics
